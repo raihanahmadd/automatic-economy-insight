@@ -74,6 +74,14 @@ def esc_amp(s):
     so labels like 'S&P 500' don't render as 'S&P;'. Leaves <b>/<i> tags intact."""
     return str(s).replace("&", "&amp;")
 
+def md_inline(s):
+    """Convert inline markdown (**bold**, *italic*) to reportlab markup,
+    escaping bare ampersands first. Used for PDF paragraphs."""
+    s = esc_amp(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", s)
+    return s
+
 def stale_flag(entry):
     return " ⚠" if entry.get("freshness", {}).get("is_stale") else ""
 
@@ -427,6 +435,93 @@ def auto_regime(data):
     return "Transitional"
 
 
+# ─────────────────────────────────────────────────────────────────
+# CONCLUSION — "Key Takeaways" derived from today's data
+# ─────────────────────────────────────────────────────────────────
+def auto_conclusion(data):
+    """
+    Build the end-of-report 'Key Takeaways' — the most important, decision-relevant
+    points distilled from today's data. Returns a list of markdown bullet strings.
+    """
+    mkt  = data.get("market_data", {})
+    fred = data.get("fred_data", {})
+    points = []
+
+    # Gather 1D / YTD moves across all market assets
+    moves_1d, moves_ytd = [], []
+    for tk, e in mkt.items():
+        if not isinstance(e, dict) or "label" not in e:
+            continue
+        p1 = parse_pct(e.get("change_1d"))
+        py = parse_pct(e.get("change_ytd"))
+        if p1 is not None:  moves_1d.append((e["label"], p1))
+        if py is not None:  moves_ytd.append((e["label"], py))
+
+    spx_1d  = parse_pct(mkt.get("^GSPC", {}).get("change_1d"))
+    gold_1d = parse_pct(mkt.get("GC=F",  {}).get("change_1d"))
+
+    # 1. Risk regime + market breadth
+    if moves_1d:
+        green = sum(1 for _, v in moves_1d if v > 0)
+        total = len(moves_1d)
+        regime = auto_regime(data)
+        breadth = f"{green} of {total} tracked assets closed higher"
+        tail = f"; S&P 500 {spx_1d:+.2f}% on the session." if spx_1d is not None else "."
+        points.append(f"**Risk regime is {regime}.** {breadth}{tail}")
+
+    # 2. Biggest movers of the day
+    if len(moves_1d) >= 2:
+        top = max(moves_1d, key=lambda x: x[1])
+        bot = min(moves_1d, key=lambda x: x[1])
+        points.append(f"**Biggest 1D movers:** {top[0]} {top[1]:+.2f}% led gains; "
+                      f"{bot[0]} {bot[1]:+.2f}% led declines.")
+
+    # 3. Rates & yield curve
+    dff = fred.get("DFF", {}).get("value")
+    d10 = fred.get("DGS10", {}).get("value")
+    d2  = fred.get("DGS2", {}).get("value")
+    if d10 and d2:
+        spread = (d10 - d2) * 100
+        if   spread < -30: state = "inverted — a historical recession warning"
+        elif spread <   0: state = "mildly inverted — caution"
+        elif spread <  50: state = "modestly positive (normal)"
+        else:              state = "steep/positive — growth expectations"
+        ff_txt = f"Fed Funds at {dff:.2f}%, " if dff else ""
+        points.append(f"**Rates:** {ff_txt}10Y {d10:.2f}% / 2Y {d2:.2f}% — "
+                      f"10Y–2Y spread {spread:+.0f} bps, {state}.")
+
+    # 4. YTD leaders / laggards
+    if moves_ytd:
+        moves_ytd.sort(key=lambda x: -x[1])
+        best, worst = moves_ytd[0], moves_ytd[-1]
+        points.append(f"**Year-to-date:** {best[0]} leads at {best[1]:+.1f}%, "
+                      f"while {worst[0]} lags at {worst[1]:+.1f}%.")
+
+    # 5. Cross-asset risk signal (equities vs gold)
+    if spx_1d is not None and gold_1d is not None:
+        if   spx_1d > 0 and gold_1d > 0:
+            points.append("**Cross-asset signal:** equities *and* gold both rose — "
+                          "macro-uncertainty pattern rather than clean risk-on; watch which breaks first.")
+        elif spx_1d < 0 and gold_1d > 0:
+            points.append("**Cross-asset signal:** equities down while gold rose — "
+                          "defensive, risk-off positioning is active.")
+        elif spx_1d > 0 and gold_1d < 0:
+            points.append("**Cross-asset signal:** equities up while gold fell — "
+                          "clean risk-on rotation out of safe havens.")
+
+    # 6. Next forward catalyst
+    cal = [c for c in data.get("calendar", []) if isinstance(c, dict) and "release_name" in c]
+    if cal:
+        nxt = cal[0]
+        extra = f", plus {len(cal)-1} more high-impact release(s) within the horizon" if len(cal) > 1 else ""
+        points.append(f"**Next catalyst:** {nxt['release_name']} on {nxt['date']}{extra} — "
+                      "expect volatility around the print.")
+
+    if not points:
+        points.append("Insufficient live data to derive conclusions — see the data quality section for flags.")
+
+    return points
+
 
 # ─────────────────────────────────────────────────────────────────
 # CHART ANALYSIS — data-driven text for each chart
@@ -695,14 +790,18 @@ def build_markdown(data, today, chart_paths):
               chart_analysis_rates(data, chart_paths[1].name),
               chart_analysis_heatmap(data, chart_paths[2].name)]
 
-    lines += ["---\n\n## 5. Forward Calendar (Next 24–72 Hours)\n"]
-    cal = [c for c in data.get("calendar",[]) if isinstance(c,dict) and "release_name" in c]
+    lines += ["---\n\n## 5. Forward Calendar (Next 14 Days)\n"]
+    raw_cal = data.get("calendar", [])
+    cal     = [c for c in raw_cal if isinstance(c, dict) and "release_name" in c]
+    no_key  = any(isinstance(c, dict) and "FRED_API_KEY" in str(c.get("error", "")) for c in raw_cal)
     if cal:
         lines += ["| Date | Event | Importance |","|---|---|---|"]
         for c in cal:
             lines.append(f"| {c.get('date','')} | {c.get('release_name','')} | {c.get('importance','')} |")
+    elif no_key:
+        lines.append("*Calendar unavailable — FRED_API_KEY not set in `.env`.*")
     else:
-        lines.append("*No upcoming events in calendar data (FRED API key required for this section).*")
+        lines.append("*No major US economic releases scheduled in the next 14 days.*")
     lines.append("")
 
     lines += ["---\n\n## 6. Data Confidence & Limitations\n",
@@ -712,6 +811,12 @@ def build_markdown(data, today, chart_paths):
         for f in flags: lines.append(f"- {f}")
     else:
         lines.append("All data sources clean — no flags raised.")
+    lines.append("")
+
+    lines += ["---\n\n## 7. Key Takeaways — What Matters Today\n"]
+    for p in auto_conclusion(data):
+        lines.append(f"- {p}")
+
     lines += ["", "---",
               "*This report is for informational and educational purposes only. Not financial advice.*"]
 
@@ -728,7 +833,28 @@ def build_pdf(data, today, md_text, chart_paths):
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                      Image, Table, TableStyle, HRFlowable)
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
     from PIL import Image as PILImage
+
+    # Embed DejaVu Sans (ships with matplotlib) so Unicode glyphs used in the
+    # analysis text — ↑ ↓ ⚠ ⚡ — and en/em dashes render instead of tofu boxes,
+    # which the built-in Helvetica cannot draw. Falls back to Helvetica if absent.
+    BODY_FONT, BOLD_FONT = "Helvetica", "Helvetica-Bold"
+    try:
+        import matplotlib
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        _ttf = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
+        if "DejaVu" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("DejaVu",        _ttf / "DejaVuSans.ttf"))
+            pdfmetrics.registerFont(TTFont("DejaVu-Bold",   _ttf / "DejaVuSans-Bold.ttf"))
+            pdfmetrics.registerFont(TTFont("DejaVu-It",     _ttf / "DejaVuSans-Oblique.ttf"))
+            pdfmetrics.registerFont(TTFont("DejaVu-BoldIt", _ttf / "DejaVuSans-BoldOblique.ttf"))
+            pdfmetrics.registerFontFamily("DejaVu", normal="DejaVu", bold="DejaVu-Bold",
+                                          italic="DejaVu-It", boldItalic="DejaVu-BoldIt")
+        BODY_FONT, BOLD_FONT = "DejaVu", "DejaVu-Bold"
+    except Exception as e:
+        print(f"  (font note: DejaVu unavailable, using Helvetica — {e})")
 
     H1C = colors.HexColor("#0d1117")
     H2C = colors.HexColor("#1f6feb")
@@ -741,15 +867,15 @@ def build_pdf(data, today, md_text, chart_paths):
     styles = getSampleStyleSheet()
 
     sH1 = ParagraphStyle("H1", parent=styles["Title"],
-                          fontSize=20, textColor=H1C, spaceAfter=4)
+                          fontName=BOLD_FONT, fontSize=20, textColor=H1C, spaceAfter=4)
     sH2 = ParagraphStyle("H2", parent=styles["Heading2"],
-                          fontSize=12, textColor=H2C, spaceBefore=16, spaceAfter=4)
+                          fontName=BOLD_FONT, fontSize=12, textColor=H2C, spaceBefore=16, spaceAfter=4)
     sBOD = ParagraphStyle("BOD", parent=styles["Normal"],
-                           fontSize=8.5, leading=13, spaceAfter=4)
+                           fontName=BODY_FONT, fontSize=8.5, leading=13, spaceAfter=4)
     sSUB = ParagraphStyle("SUB", parent=styles["Normal"],
-                           fontSize=7, leading=10, textColor=colors.HexColor("#6e7781"))
+                           fontName=BODY_FONT, fontSize=7, leading=10, textColor=colors.HexColor("#6e7781"))
     sBUL = ParagraphStyle("BUL", parent=styles["Normal"],
-                           fontSize=8.5, leading=13, leftIndent=10, spaceAfter=2)
+                           fontName=BODY_FONT, fontSize=8.5, leading=13, leftIndent=10, spaceAfter=2)
 
     meta    = data.get("_meta", {})
     quality = data.get("_quality", {})
@@ -801,7 +927,8 @@ def build_pdf(data, today, md_text, chart_paths):
             ("BACKGROUND",   (0,0),(-1,0), colors.HexColor("#0d1117")),
             ("TEXTCOLOR",    (0,0),(-1,0), colors.white),
             ("FONTSIZE",     (0,0),(-1,-1), 7.5),
-            ("FONTNAME",     (0,0),(-1,0), "Helvetica-Bold"),
+            ("FONTNAME",     (0,0),(-1,-1), BODY_FONT),
+            ("FONTNAME",     (0,0),(-1,0), BOLD_FONT),
             ("GRID",         (0,0),(-1,-1), 0.3, colors.HexColor("#d0d7de")),
             ("ROWBACKGROUNDS",(0,1),(-1,-1), [colors.white, colors.HexColor("#f6f8fa")]),
             ("VALIGN",       (0,0),(-1,-1), "MIDDLE"),
@@ -823,15 +950,18 @@ def build_pdf(data, today, md_text, chart_paths):
         clean = clean.replace("*","<i>",1).replace("*","</i>",1) if "*" in clean else clean
         elems.append(Paragraph(clean, sBOD))
 
-    # Section 4 — Charts
-    elems.append(Paragraph("4. Chart Pack", sH2))
+    # Section 4 — Charts + per-chart analysis (key points)
+    elems.append(Paragraph("4. Chart Analysis", sH2))
     chart_titles = ["Chart 1: Major Equity Indices — 30-day normalized",
                     "Chart 2: US Rates & Yields — 30-day trend",
                     "Chart 3: Cross-Asset Performance Heatmap"]
+    analyses = [chart_analysis_equity(data,  chart_paths[0].name),
+                chart_analysis_rates(data,   chart_paths[1].name),
+                chart_analysis_heatmap(data, chart_paths[2].name)]
     # Fit each chart into a bounding box while preserving its native aspect
     # ratio, so square-ish charts (e.g. the heatmap) are not stretched flat.
     max_w, max_h = 16.5*cm, 9.5*cm
-    for cp, title in zip(chart_paths, chart_titles):
+    for cp, title, analysis in zip(chart_paths, chart_titles, analyses):
         elems.append(Paragraph(f"<b>{title}</b>", sSUB))
         if cp.exists():
             iw, ih = PILImage.open(str(cp)).size
@@ -843,11 +973,24 @@ def build_pdf(data, today, md_text, chart_paths):
             elems.append(Image(str(cp), width=disp_w, height=disp_h))
         else:
             elems.append(Paragraph("[Chart file missing]", sSUB))
-        elems.append(Spacer(1, 0.25*cm))
+        elems.append(Spacer(1, 0.15*cm))
+        # Render the markdown analysis (skip the ### heading and ![image] lines —
+        # the PDF already has its own chart title and embedded image).
+        for raw in analysis.split("\n"):
+            ln = raw.strip()
+            if not ln or ln.startswith("###") or ln.startswith("!["):
+                continue
+            if ln.startswith("- "):
+                elems.append(Paragraph("• " + md_inline(ln[2:]), sBUL))
+            else:
+                elems.append(Paragraph(md_inline(ln), sBOD))
+        elems.append(Spacer(1, 0.4*cm))
 
     # Section 5 — Calendar
-    elems.append(Paragraph("5. Forward Calendar (Next 24–72 Hours)", sH2))
-    cal = [c for c in data.get("calendar",[]) if isinstance(c,dict) and "release_name" in c]
+    elems.append(Paragraph("5. Forward Calendar (Next 14 Days)", sH2))
+    raw_cal = data.get("calendar", [])
+    cal     = [c for c in raw_cal if isinstance(c, dict) and "release_name" in c]
+    no_key  = any(isinstance(c, dict) and "FRED_API_KEY" in str(c.get("error", "")) for c in raw_cal)
     if cal:
         cal_rows = [["Date","Event","Importance"]]
         for c in cal:
@@ -858,12 +1001,16 @@ def build_pdf(data, today, md_text, chart_paths):
             ("BACKGROUND",  (0,0),(-1,0), colors.HexColor("#0d1117")),
             ("TEXTCOLOR",   (0,0),(-1,0), colors.white),
             ("FONTSIZE",    (0,0),(-1,-1), 7.5),
+            ("FONTNAME",    (0,0),(-1,-1), BODY_FONT),
+            ("FONTNAME",    (0,0),(-1,0), BOLD_FONT),
             ("GRID",        (0,0),(-1,-1), 0.3, colors.HexColor("#d0d7de")),
             ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, colors.HexColor("#f6f8fa")]),
         ]))
         elems.append(ct)
+    elif no_key:
+        elems.append(Paragraph("Calendar unavailable — FRED_API_KEY not set in .env.", sBOD))
     else:
-        elems.append(Paragraph("No upcoming events. (FRED_API_KEY required for calendar.)", sBOD))
+        elems.append(Paragraph("No major US economic releases scheduled in the next 14 days.", sBOD))
 
     # Section 6 — Confidence
     elems.append(Paragraph("6. Data Confidence & Limitations", sH2))
@@ -874,6 +1021,11 @@ def build_pdf(data, today, md_text, chart_paths):
         elems.append(Paragraph(f"<font color='{color}'>• {f}</font>", sSUB))
     if not quality.get("flags"):
         elems.append(Paragraph("• All sources clean — no flags raised.", sSUB))
+
+    # Section 7 — Key Takeaways (conclusion)
+    elems.append(Paragraph("7. Key Takeaways — What Matters Today", sH2))
+    for p in auto_conclusion(data):
+        elems.append(Paragraph("• " + md_inline(p), sBUL))
 
     elems.append(Spacer(1, 0.6*cm))
     elems.append(HRFlowable(width="100%", thickness=0.5,

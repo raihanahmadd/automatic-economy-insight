@@ -137,16 +137,23 @@ WORLD_BANK_INDICATORS = {
 # This dict is kept only as documentation of the asset categories in use.
 FRESHNESS_CATEGORIES = ("equity", "fx", "crypto", "commodity", "us_macro", "intl_macro")
 
-# Upcoming economic releases to track (FRED release IDs)
+# Upcoming economic releases to track (FRED release IDs).
+# IDs verified against the FRED /release endpoint — the previous set was wrong
+# (82=Economic Report of the President, 175=Personal Income by County, 18=H.15
+# Rates, 50 is actually Employment Situation). ISM PMI / Consumer Confidence are
+# NOT published on FRED (private surveys), so they are intentionally omitted.
 FRED_RELEASE_IDS = {
-    82:  "Employment Situation (NFP + Unemployment)",
-    10:  "Consumer Price Index (CPI)",
-    46:  "Producer Price Index (PPI)",
-    53:  "Gross Domestic Product (GDP)",
-    175: "Consumer Confidence Index",
-    18:  "Advance Monthly Retail Trade Survey",
-    50:  "ISM Manufacturing PMI",
+    50: "Employment Situation (NFP + Unemployment)",
+    10: "Consumer Price Index (CPI)",
+    54: "Personal Income & Outlays (PCE inflation)",
+    46: "Producer Price Index (PPI)",
+    53: "Gross Domestic Product (GDP)",
+    9:  "Advance Retail Sales",
+    11: "Employment Cost Index",
 }
+
+# How many days ahead the forward calendar looks.
+CALENDAR_HORIZON_DAYS = 14
 
 # ─────────────────────────────────────────────────────────────────
 # 2. UTILITY FUNCTIONS
@@ -511,17 +518,23 @@ def fetch_world_bank() -> dict:
 
 def fetch_economic_calendar() -> list:
     """
-    Fetch upcoming major economic data releases from FRED (next 7 days).
-    Requires FRED API key. Returns list sorted by date.
+    Fetch upcoming major economic data releases from FRED (next
+    CALENDAR_HORIZON_DAYS days). Requires FRED API key. Returns list sorted by date.
     Note: FRED only covers US macro releases.
+
+    Key detail: FRED's /release/dates returns only PAST dates that already have
+    data unless `include_release_dates_with_no_data=true` is set — that flag is
+    what surfaces the future scheduled dates. We then filter to our horizon.
     """
     if not FRED_API_KEY:
         log.warning("FRED_API_KEY missing — skipping calendar fetch")
         return [{"error": "FRED_API_KEY required for calendar fetch"}]
 
     upcoming   = []
-    today_str  = date.today().isoformat()
-    end_str    = (date.today() + timedelta(days=7)).isoformat()
+    today      = date.today()
+    today_str  = today.isoformat()
+    horizon    = today + timedelta(days=CALENDAR_HORIZON_DAYS)
+    seen       = set()  # (release_id, date) — dedupe repeated schedule rows
 
     for release_id, release_name in FRED_RELEASE_IDS.items():
         try:
@@ -529,7 +542,9 @@ def fetch_economic_calendar() -> list:
                 f"https://api.stlouisfed.org/fred/release/dates"
                 f"?release_id={release_id}"
                 f"&realtime_start={today_str}"
-                f"&realtime_end={end_str}"
+                f"&realtime_end=9999-12-31"
+                f"&include_release_dates_with_no_data=true"  # surface FUTURE scheduled dates
+                f"&sort_order=asc"
                 f"&api_key={FRED_API_KEY}"
                 f"&file_type=json"
             )
@@ -539,7 +554,12 @@ def fetch_economic_calendar() -> list:
 
             for entry in data.get("release_dates", []):
                 release_date = entry.get("date", "")
-                if today_str <= release_date <= end_str:
+                try:
+                    rd = date.fromisoformat(release_date)
+                except ValueError:
+                    continue
+                if today <= rd <= horizon and (release_id, release_date) not in seen:
+                    seen.add((release_id, release_date))
                     upcoming.append({
                         "release_name": release_name,
                         "release_id":   release_id,
@@ -553,7 +573,7 @@ def fetch_economic_calendar() -> list:
             log.error(f"Calendar fetch for release_id={release_id} failed: {e}")
 
     upcoming.sort(key=lambda x: x.get("date", ""))
-    log.info(f"  Calendar: {len(upcoming)} major US releases in next 7 days")
+    log.info(f"  Calendar: {len(upcoming)} major US releases in next {CALENDAR_HORIZON_DAYS} days")
     return upcoming
 
 # ─────────────────────────────────────────────────────────────────
