@@ -24,7 +24,9 @@ Setup:
 """
 
 import os
+import sys
 import json
+import time
 import logging
 import traceback
 from datetime import datetime, timedelta, date
@@ -33,6 +35,14 @@ from pathlib import Path
 import pytz
 import requests
 from dotenv import load_dotenv
+
+# Windows consoles default to a legacy code page (e.g. cp932 on JP locale)
+# that cannot encode the arrow/check glyphs used in log messages — force UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 # ─────────────────────────────────────────────────────────────────
 # 0. BOOTSTRAP — Environment, Paths, Logging
@@ -71,7 +81,7 @@ log = logging.getLogger(__name__)
 # 1. CONFIGURATION — All indicators defined in Output Contract v2
 # ─────────────────────────────────────────────────────────────────
 
-FRED_API_KEY = os.getenv("50c409688ecc9b2c76a316e956f67ef0")
+FRED_API_KEY = os.getenv("FRED_API_KEY")
 
 # FRED series → (human label, category, unit)
 # unit: "percent" → changes reported in bps; "index"/"billions_usd" → reported as %
@@ -85,11 +95,13 @@ FRED_SERIES = {
     "GDP":              ("Real GDP (quarterly)",      "us_macro",   "billions_usd"),
     # ── International CB Rates (available via FRED) ───
     "ECBDFR":           ("ECB Deposit Rate",          "intl_macro", "percent"),
-    "BOERUKMINLAMFSAM": ("BOE Bank Rate",             "intl_macro", "percent"),
+    # UK: SONIA daily rate tracks the BOE Bank Rate within a few bps.
+    # (The old BOERUKMINLAMFSAM series was discontinued by FRED.)
+    "IUDSOIA":          ("BOE Bank Rate (SONIA)",     "intl_macro", "percent"),
     # Japan short-term rate (BOJ policy rate proxy)
     "IRSTCI01JPM156N":  ("BOJ Short-Term Rate",       "intl_macro", "percent"),
-    # Japan CPI (relevant to Kumamoto base)
-    "JPNCPIALLMINMEI":  ("Japan CPI (All Items)",     "intl_macro", "index"),
+    # NOTE: Japan CPI dropped — the OECD MEI FRED series were discontinued
+    # in 2024. Japan inflation is already covered via World Bank below.
 }
 
 # yfinance tickers → (human label, category)
@@ -216,6 +228,14 @@ def compute_baselines(series, unit: str) -> dict:
     result["value"]   = latest_val
     result["as_of"]   = latest_date
 
+    # Recent daily history (last 60 readings) — consumed by the 30-day
+    # trend charts in render_report.py via get_history().
+    tail = series.tail(60)
+    result["history"] = [
+        {"date": str(idx.date()), "value": round(float(val), 6)}
+        for idx, val in tail.items()
+    ]
+
     # Change function: bps for rates/yields, % for everything else
     delta_fn = bps_change if unit == "percent" else pct_change
 
@@ -320,6 +340,27 @@ def fetch_fred() -> dict:
 # 4. YFINANCE FETCHER
 # ─────────────────────────────────────────────────────────────────
 
+def _build_yf_session():
+    """
+    Return a browser-impersonating curl_cffi session.
+
+    Yahoo Finance rate-limits (HTTP 429) the default `requests` TLS
+    fingerprint/User-Agent, which causes every ticker to fail with
+    YFRateLimitError. A curl_cffi session impersonating Chrome passes
+    Yahoo's checks. Returns None if curl_cffi is unavailable (yfinance
+    then falls back to its default session and may be rate-limited).
+    """
+    try:
+        from curl_cffi import requests as cffi_requests
+        return cffi_requests.Session(impersonate="chrome")
+    except ImportError:
+        log.warning(
+            "curl_cffi not installed — Yahoo Finance may rate-limit (HTTP 429). "
+            "Install with: pip install curl_cffi"
+        )
+        return None
+
+
 def fetch_yfinance() -> dict:
     """
     Fetch market prices for all tickers in YFINANCE_TICKERS.
@@ -334,22 +375,32 @@ def fetch_yfinance() -> dict:
         log.error("yfinance not installed. Run: pip install yfinance")
         return {"_error": "yfinance not installed"}
 
+    session = _build_yf_session()
     tickers_str = " ".join(YFINANCE_TICKERS.keys())
 
-    try:
-        log.info("  Downloading batch price data from Yahoo Finance...")
-        raw = yf.download(
-            tickers=tickers_str,
-            period="400d",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-    except Exception as e:
-        log.error(f"yfinance batch download failed: {e}")
-        raw = None
+    # threads=False + a browser-impersonating session avoids the connection-pool
+    # exhaustion and 429 rate-limiting that previously failed every ticker.
+    raw = None
+    log.info("  Downloading batch price data from Yahoo Finance...")
+    for attempt in range(1, 4):
+        try:
+            raw = yf.download(
+                tickers=tickers_str,
+                period="400d",
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                session=session,
+            )
+            if raw is not None and not raw.empty:
+                break
+            log.warning(f"  Batch download empty (attempt {attempt}/3)")
+        except Exception as e:
+            log.warning(f"  Batch download failed (attempt {attempt}/3): {e}")
+        if attempt < 3:
+            time.sleep(3 * attempt)
 
     for ticker, (label, category) in YFINANCE_TICKERS.items():
         try:
@@ -373,9 +424,11 @@ def fetch_yfinance() -> dict:
             # Per-ticker fallback if batch extraction failed
             if close_series is None or close_series.empty:
                 log.warning(f"  Batch extraction failed for {ticker} — falling back to single download")
+                time.sleep(1)
                 single = yf.download(
                     ticker, period="400d", interval="1d",
-                    auto_adjust=True, progress=False
+                    auto_adjust=True, progress=False,
+                    threads=False, session=session,
                 )
                 close_series = single["Close"].dropna() if not single.empty else None
 
@@ -674,7 +727,7 @@ def main() -> dict:
             "date":             TODAY,
             "generated_jst":    ts_now(),
             "timezone":         "Asia/Tokyo (JST, UTC+9)",
-            "script_version":   "1.0.0",
+            "script_version":   "1.1.0",
             "prior_state_date": prior_state.get("date", "none — first run"),
             "output_contract":  "v2",
         },

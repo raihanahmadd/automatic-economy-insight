@@ -4,6 +4,7 @@
 # Data sources
 fredapi==0.5.1        # FRED API client
 yfinance==0.2.54      # Yahoo Finance market data
+curl_cffi>=0.7.0      # Browser-impersonating session for yfinance (avoids Yahoo 429 rate-limiting)
 
 # HTTP & environment
 requests>=2.31.0      # World Bank API + FRED calendar

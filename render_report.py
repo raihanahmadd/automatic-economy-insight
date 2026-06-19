@@ -21,6 +21,14 @@ import sys, json, re, math
 from pathlib import Path
 from datetime import datetime
 
+# Windows consoles default to a legacy code page (e.g. cp932 on JP locale)
+# that cannot encode the ✓/⚠/✗ status glyphs — force UTF-8 to avoid crashes.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -60,6 +68,11 @@ def fmt_val(v, decimals=2):
     if v is None: return "N/A"
     if abs(v) >= 1000: return f"{v:,.{decimals}f}"
     return f"{v:.{decimals}f}"
+
+def esc_amp(s):
+    """Escape bare '&' for reportlab Paragraph (which parses HTML entities),
+    so labels like 'S&P 500' don't render as 'S&P;'. Leaves <b>/<i> tags intact."""
+    return str(s).replace("&", "&amp;")
 
 def stale_flag(entry):
     return " ⚠" if entry.get("freshness", {}).get("is_stale") else ""
@@ -715,6 +728,7 @@ def build_pdf(data, today, md_text, chart_paths):
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                      Image, Table, TableStyle, HRFlowable)
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from PIL import Image as PILImage
 
     H1C = colors.HexColor("#0d1117")
     H2C = colors.HexColor("#1f6feb")
@@ -756,7 +770,7 @@ def build_pdf(data, today, md_text, chart_paths):
     # Section 1 — Summary
     elems.append(Paragraph("1. Executive Summary", sH2))
     for b in auto_summary(data):
-        elems.append(Paragraph(f"• {b}", sBUL))
+        elems.append(Paragraph(f"• {esc_amp(b)}", sBUL))
 
     # Section 2 — Dashboard
     elems.append(Paragraph("2. Key Indicators Dashboard", sH2))
@@ -805,7 +819,7 @@ def build_pdf(data, today, md_text, chart_paths):
     elems.append(Paragraph("3. Market Narrative", sH2))
     elems.append(Paragraph(f"<b>Risk Regime: {auto_regime(data)}</b>", sBOD))
     for para in auto_narrative(data).split("\n\n"):
-        clean = para.replace("**","<b>",1).replace("**","</b>",1)
+        clean = esc_amp(para).replace("**","<b>",1).replace("**","</b>",1)
         clean = clean.replace("*","<i>",1).replace("*","</i>",1) if "*" in clean else clean
         elems.append(Paragraph(clean, sBOD))
 
@@ -814,10 +828,19 @@ def build_pdf(data, today, md_text, chart_paths):
     chart_titles = ["Chart 1: Major Equity Indices — 30-day normalized",
                     "Chart 2: US Rates & Yields — 30-day trend",
                     "Chart 3: Cross-Asset Performance Heatmap"]
+    # Fit each chart into a bounding box while preserving its native aspect
+    # ratio, so square-ish charts (e.g. the heatmap) are not stretched flat.
+    max_w, max_h = 16.5*cm, 9.5*cm
     for cp, title in zip(chart_paths, chart_titles):
         elems.append(Paragraph(f"<b>{title}</b>", sSUB))
         if cp.exists():
-            elems.append(Image(str(cp), width=16.5*cm, height=7.4*cm))
+            iw, ih = PILImage.open(str(cp)).size
+            disp_w = max_w
+            disp_h = disp_w * (ih / iw)
+            if disp_h > max_h:
+                disp_h = max_h
+                disp_w = disp_h * (iw / ih)
+            elems.append(Image(str(cp), width=disp_w, height=disp_h))
         else:
             elems.append(Paragraph("[Chart file missing]", sSUB))
         elems.append(Spacer(1, 0.25*cm))
